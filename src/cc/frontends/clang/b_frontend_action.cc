@@ -766,7 +766,7 @@ bool BTypeVisitor::VisitCallExpr(CallExpr *Call) {
             return false;
           }
         }
-        string fd = to_string(desc->second.fd);
+        string fd = to_string(desc->second.fake_fd);
         string prefix, suffix;
         string txt;
         auto rewrite_start = GET_BEGINLOC(Call);
@@ -1230,14 +1230,10 @@ bool BTypeVisitor::VisitVarDecl(VarDecl *Decl) {
       }
 
       table.type = map_type;
-      table.fd = bcc_create_map(map_type, table.name.c_str(),
-                                table.key_size, table.leaf_size,
-                                table.max_entries, table.flags);
-    }
-    if (table.fd < 0) {
-      error(GET_BEGINLOC(Decl), "could not open bpf map: %0\nis %1 map type enabled in your kernel?") <<
-          strerror(errno) << A->getName();
-      return false;
+      table.fake_fd = fe_.get_next_fake_fd();
+      fe_.add_map_def(table.fake_fd, std::make_tuple((int)map_type, std::string(table.name),
+                                 (int)table.key_size, (int)table.leaf_size,
+                                 (int)table.max_entries, table.flags));
     }
 
     if (!table.is_extern)
@@ -1351,7 +1347,8 @@ BFrontendAction::BFrontendAction(llvm::raw_ostream &os, unsigned flags,
                                  TableStorage &ts, const std::string &id,
                                  const std::string &main_path,
                                  FuncSource &func_src, std::string &mod_src,
-                                 const std::string &maps_ns)
+                                 const std::string &maps_ns,
+                                 std::map<int, std::tuple<int, std::string, int, int, int, int>> &fake_fd_maps)
     : os_(os),
       flags_(flags),
       ts_(ts),
@@ -1360,7 +1357,9 @@ BFrontendAction::BFrontendAction(llvm::raw_ostream &os, unsigned flags,
       rewriter_(new Rewriter),
       main_path_(main_path),
       func_src_(func_src),
-      mod_src_(mod_src) {}
+      mod_src_(mod_src),
+      next_fake_fd_(1),
+      fake_fd_maps_(fake_fd_maps) {}
 
 bool BFrontendAction::is_rewritable_ext_func(FunctionDecl *D) {
   StringRef file_name = rewriter_->getSourceMgr().getFilename(GET_BEGINLOC(D));
@@ -1399,11 +1398,17 @@ void BFrontendAction::EndSourceFileAction() {
 
   if (flags_ & DEBUG_PREPROCESSOR)
     rewriter_->getEditBuffer(rewriter_->getSourceMgr().getMainFileID()).write(llvm::errs());
+#if LLVM_MAJOR_VERSION >= 9
+  llvm::raw_string_ostream tmp_os(mod_src_);
+  rewriter_->getEditBuffer(rewriter_->getSourceMgr().getMainFileID())
+      .write(tmp_os);
+#else
   if (flags_ & DEBUG_SOURCE) {
     llvm::raw_string_ostream tmp_os(mod_src_);
     rewriter_->getEditBuffer(rewriter_->getSourceMgr().getMainFileID())
         .write(tmp_os);
   }
+#endif
 
   for (auto func : func_range_) {
     auto f = func.first;

@@ -42,6 +42,8 @@
 #include "bpf_module.h"
 #include "exported_files.h"
 #include "libbpf.h"
+#include "btf.h"
+#include "libbpf/src/bpf.h"
 
 namespace ebpf {
 
@@ -69,7 +71,7 @@ class MyMemoryManager : public SectionMemoryManager {
   uint8_t *allocateCodeSection(uintptr_t Size, unsigned Alignment,
                                unsigned SectionID,
                                StringRef SectionName) override {
-    uint8_t *Addr = SectionMemoryManager::allocateCodeSection(Size, Alignment, SectionID, SectionName);
+    uint8_t *Addr = SectionMemoryManager::allocateDataSection(Size, Alignment, SectionID, SectionName, false);
     //printf("allocateCodeSection: %s Addr %p Size %ld Alignment %d SectionID %d\n",
     //       SectionName.str().c_str(), (void *)Addr, Size, Alignment, SectionID);
     (*sections_)[SectionName.str()] = make_tuple(Addr, Size);
@@ -95,7 +97,7 @@ BPFModule::BPFModule(unsigned flags, TableStorage *ts, bool rw_engine_enabled,
       ctx_(new LLVMContext),
       id_(std::to_string((uintptr_t)this)),
       maps_ns_(maps_ns),
-      ts_(ts) {
+      ts_(ts), btf_(nullptr) {
   initialize_rw_engine();
   LLVMInitializeBPFTarget();
   LLVMInitializeBPFTargetMC();
@@ -139,6 +141,9 @@ BPFModule::~BPFModule() {
   ctx_.reset();
   func_src_.reset();
 
+  if (btf_ != nullptr)
+    delete btf_;
+
   ts_->DeletePrefix(Path({id_}));
 }
 
@@ -150,7 +155,7 @@ int BPFModule::free_bcc_memory() {
 int BPFModule::load_cfile(const string &file, bool in_memory, const char *cflags[], int ncflags) {
   ClangLoader clang_loader(&*ctx_, flags_);
   if (clang_loader.parse(&mod_, *ts_, file, in_memory, cflags, ncflags, id_,
-                         *func_src_, mod_src_, maps_ns_))
+                         *func_src_, mod_src_, maps_ns_, fake_fd_maps_))
     return -1;
   return 0;
 }
@@ -163,7 +168,7 @@ int BPFModule::load_cfile(const string &file, bool in_memory, const char *cflags
 int BPFModule::load_includes(const string &text) {
   ClangLoader clang_loader(&*ctx_, flags_);
   if (clang_loader.parse(&mod_, *ts_, text, true, nullptr, 0, "", *func_src_,
-                         mod_src_, ""))
+                         mod_src_, "", fake_fd_maps_))
     return -1;
   return 0;
 }
@@ -214,6 +219,168 @@ int BPFModule::run_pass_manager(Module &mod) {
   return 0;
 }
 
+// Mainly do two things:
+// 1. Rewrite all LD_PSEUDO instructions.
+// 2. For any line info with missing lines due to remapped files,
+//    change .BTF and .BTF.ext to correct these line infos with
+//    correct lines.
+void BPFModule::postprocess_btf(const std::string &mod_fname,
+    std::map<std::string, std::tuple<uint8_t *, uintptr_t>> &sections) {
+  load_btf(mod_fname);
+  load_maps(sections);
+}
+
+void BPFModule::load_btf(const std::string &mod_fname) {
+  uint8_t *btf_sec = nullptr, *btf_ext_sec = nullptr;
+  uintptr_t btf_sec_size, btf_ext_sec_size;
+
+  for (auto section: sections_) {
+    auto sname = section.first;
+    uint8_t *addr = get<0>(section.second);
+    uintptr_t size = get<1>(section.second);
+
+    if (strcmp(".BTF", sname.c_str()) == 0) {
+      btf_sec = addr;
+      btf_sec_size = size;
+    }
+
+    if (strcmp(".BTF.ext", sname.c_str()) == 0) {
+      btf_ext_sec = addr;
+      btf_ext_sec_size = size;
+    }
+  }
+
+  if (btf_sec == nullptr || btf_ext_sec == nullptr)
+    return;
+
+  auto helpers_h = ExportedFiles::headers().find("/virtual/include/bcc/helpers.h");
+  if (helpers_h == ExportedFiles::headers().end()) {
+    fprintf(stderr, "Internal error: missing bcc/helpers.h");
+    return;
+  }
+  std::map<std::string, std::string> remapped_sources;
+  remapped_sources[mod_fname] = mod_src_;
+  remapped_sources["/virtual/include/bcc/helpers.h"] = helpers_h->second;
+
+  btf_ = new BTF(btf_sec, btf_sec_size, btf_ext_sec, btf_ext_sec_size,
+                 remapped_sources);
+  btf_->adjust();
+
+  int ret = btf_->load();
+  if (ret) {
+    fprintf(stderr, "BTF load failed\n");
+    delete btf_;
+    btf_ = nullptr;
+    return;
+  }
+  fprintf(stderr, "BTF load succeeded\n");
+}
+
+void BPFModule::load_maps(std::map<std::string, std::tuple<uint8_t *, uintptr_t>> &sections) {
+  std::map<std::string, std::pair<int, int>> map_tids;
+
+  // Find .maps.<table_name> sections
+fprintf(stderr, "find map tids\n");
+  for (auto section : sections) {
+    auto sec_name = section.first;
+    if (strncmp(".maps.", sec_name.c_str(), 6) == 0) {
+      std::string map_name = sec_name.substr(6);
+      unsigned key_tid = 0, value_tid = 0;
+      unsigned expected_ksize = 0, expected_vsize = 0;
+
+      for (auto map : fake_fd_maps_) {
+        std::string name;
+
+        name = get<1>(map.second);
+        if (map_name == name) {
+          expected_ksize = get<2>(map.second);
+          expected_vsize = get<3>(map.second);
+          break;
+        }
+      }
+
+      if (expected_ksize == 0) {
+        fprintf(stderr, "did not find the expected ksize\n");
+        continue;
+      }
+
+      int ret = btf_->get_map_tids(map_name, expected_ksize,
+                  expected_vsize, &key_tid, &value_tid);
+      if (ret) {
+        fprintf(stderr, "did not get map tid for map %s\n", sec_name.c_str());
+        continue;
+      }
+fprintf(stderr, "map %s: %u, %u\n", map_name.c_str(), key_tid, value_tid);
+      map_tids[map_name] = std::make_pair(key_tid, value_tid);
+    }
+  }
+
+  // Create maps
+fprintf(stderr, "create maps\n");
+  std::map<int, int> map_fds;
+  for (auto map : fake_fd_maps_) {
+    int fd, fake_fd, map_type, key_size, value_size, max_entries, map_flags;
+    const char *map_name;
+
+    fake_fd     = map.first;
+    map_type    = get<0>(map.second);
+    map_name    = get<1>(map.second).c_str();
+    key_size    = get<2>(map.second);
+    value_size  = get<3>(map.second);
+    max_entries = get<4>(map.second);
+    map_flags   = get<5>(map.second);
+fprintf(stderr, "map %s\n", map_name);
+
+    struct bpf_create_map_attr attr = {};
+    attr.map_type = (enum bpf_map_type)map_type;
+    attr.name = map_name;
+    attr.key_size = key_size;
+    attr.value_size = value_size;
+    attr.max_entries = max_entries;
+    attr.map_flags = map_flags;
+    attr.btf_fd = btf_->get_fd();
+
+    if (map_tids.find(map_name) != map_tids.end()) {
+      attr.btf_key_type_id = map_tids[map_name].first;
+      attr.btf_value_type_id = map_tids[map_name].second;
+    }
+
+    fd = bcc_create_map_xattr(&attr);
+    if (fd < 0)
+      fprintf(stderr, "bcc_create_map failed\n");
+
+    map_fds[fake_fd] = fd;
+  }
+
+  /* update tables */
+fprintf(stderr, "update tables\n");
+  for (auto table : tables_)
+    table->fd = map_fds[table->fake_fd];
+
+  /* update instructions */
+fprintf(stderr, "update instructions\n");
+  for (auto section : sections) {
+    auto sec_name = section.first;
+    if (strncmp(".bpf.fn.", sec_name.c_str(), 8) == 0) {
+      uint8_t *addr = get<0>(section.second);
+      uintptr_t size = get<1>(section.second);
+      struct bpf_insn *insns = (struct bpf_insn *)addr;
+      int i, num_insns;
+
+      num_insns = size/sizeof(struct bpf_insn);
+      for (i = 0; i < num_insns; i++) {
+        if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM)) {
+          // change map_fd is it is a ld_pseudo */
+          if (insns[i].src_reg == BPF_PSEUDO_MAP_FD)
+            insns[i].imm = map_fds[insns[i].imm];
+          i++;
+        }
+      }
+    }
+  }
+fprintf(stderr, "%s successful\n", __func__);
+}
+
 int BPFModule::finalize() {
   Module *mod = &*mod_;
   std::map<std::string, std::tuple<uint8_t *, uintptr_t>> tmp_sections,
@@ -256,6 +423,8 @@ int BPFModule::finalize() {
                                 src_dbg_fmap_);
     src_debugger.dump();
   }
+
+  postprocess_btf(mod->getSourceFileName(), *sections_p);
 
   if (!rw_engine_enabled_) {
     // Setup sections_ correctly and then free llvm internal memory
@@ -647,6 +816,40 @@ int BPFModule::load_string(const string &text, const char *cflags[], int ncflags
   if (int rc = finalize())
     return rc;
   return 0;
+}
+
+int BPFModule::bcc_func_load(int prog_type, const char *name,
+                const struct bpf_insn *insns, int prog_len,
+                const char *license, unsigned kern_version,
+                int log_level, char *log_buf, unsigned log_buf_size) {
+  int ret, btf_fd;
+  unsigned func_info_cnt, line_info_cnt, finfo_rec_size, linfo_rec_size;
+  void *func_info, *line_info;
+  char secname[256];
+
+  ::snprintf(secname, sizeof(secname), ".bpf.fn.%s", name);
+  ret = btf_->get_btf_info(secname, &btf_fd, &func_info, &func_info_cnt, &finfo_rec_size,
+                           &line_info, &line_info_cnt, &linfo_rec_size);
+
+  struct bpf_load_program_attr attr = {};
+
+  attr.prog_type = (enum bpf_prog_type)prog_type;
+  attr.name = name;
+  attr.insns = insns;
+  attr.license = license;
+  attr.kern_version = kern_version;
+  attr.log_level = log_level;
+  if (!ret) {
+    attr.prog_btf_fd = btf_fd;
+    attr.func_info = func_info;
+    attr.func_info_cnt = func_info_cnt;
+    attr.func_info_rec_size = finfo_rec_size;
+    attr.line_info = line_info;
+    attr.line_info_cnt = line_info_cnt;
+    attr.line_info_rec_size = linfo_rec_size;
+  }
+
+  return bcc_prog_load_xattr(&attr, prog_len, log_buf, log_buf_size);
 }
 
 } // namespace ebpf

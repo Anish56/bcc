@@ -116,7 +116,7 @@ static int trace_connect_return(struct pt_regs *ctx, short ipver)
     if (ret != 0) {
         // failed to send SYNC packet, may not have populated
         // socket __sk_common.{skc_rcv_saddr, ...}
-        currsock.delete(&pid);
+        // currsock.delete(&pid);
         return 0;
     }
 
@@ -149,7 +149,7 @@ static int trace_connect_return(struct pt_regs *ctx, short ipver)
         ipv6_events.perf_submit(ctx, &data6, sizeof(data6));
     }
 
-    currsock.delete(&pid);
+    // // currsock.delete(&pid);
 
     return 0;
 }
@@ -244,7 +244,7 @@ def print_ipv6_event(cpu, data, size):
         event.dport))
 
 # initialize BPF
-b = BPF(text=bpf_text)
+b = BPF(text=bpf_text, debug=8)
 b.attach_kprobe(event="tcp_v4_connect", fn_name="trace_connect_entry")
 b.attach_kprobe(event="tcp_v6_connect", fn_name="trace_connect_entry")
 b.attach_kretprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_return")

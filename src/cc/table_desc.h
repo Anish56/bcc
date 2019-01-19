@@ -88,6 +88,7 @@ class TableDesc {
 
   std::string name;
   FileDesc fd;
+  int fake_fd;
   int type;
   size_t key_size;  // sizes are in bytes
   size_t leaf_size;

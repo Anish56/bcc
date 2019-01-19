@@ -155,7 +155,8 @@ class BFrontendAction : public clang::ASTFrontendAction {
   BFrontendAction(llvm::raw_ostream &os, unsigned flags, TableStorage &ts,
                   const std::string &id, const std::string &main_path,
                   FuncSource &func_src, std::string &mod_src,
-                  const std::string &maps_ns);
+                  const std::string &maps_ns,
+                  std::map<int, std::tuple<int, std::string, int, int, int, int>> &fake_fd_maps);
 
   // Called by clang when the AST has been completed, here the output stream
   // will be flushed.
@@ -170,6 +171,10 @@ class BFrontendAction : public clang::ASTFrontendAction {
   std::string maps_ns() const { return maps_ns_; }
   bool is_rewritable_ext_func(clang::FunctionDecl *D);
   void DoMiscWorkAround();
+  unsigned get_next_fake_fd() { return next_fake_fd_++; }
+  void add_map_def(int fd, std::tuple<int, std::string, int, int, int, int> map_def) {
+    fake_fd_maps_[fd] = map_def;
+  }
 
  private:
   llvm::raw_ostream &os_;
@@ -184,6 +189,8 @@ class BFrontendAction : public clang::ASTFrontendAction {
   FuncSource &func_src_;
   std::string &mod_src_;
   std::set<clang::Decl *> m_;
+  int next_fake_fd_;
+  std::map<int, std::tuple<int, std::string, int, int, int, int>> &fake_fd_maps_;
 };
 
 }  // namespace visitor

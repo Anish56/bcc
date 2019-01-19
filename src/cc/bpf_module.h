@@ -32,6 +32,8 @@ class Module;
 class Type;
 }
 
+struct bpf_insn;
+
 namespace ebpf {
 
 // Options to enable different debug logging.
@@ -53,6 +55,7 @@ class TableStorage;
 class BLoader;
 class ClangLoader;
 class FuncSource;
+class BTF;
 
 bool bpf_module_rw_engine_enabled(void);
 
@@ -78,6 +81,10 @@ class BPFModule {
   StatusTuple sscanf(std::string fn_name, const char *str, void *val);
   StatusTuple snprintf(std::string fn_name, char *str, size_t sz,
                        const void *val);
+  void postprocess_btf(const std::string &mod_fname,
+                       std::map<std::string, std::tuple<uint8_t *, uintptr_t>> &sections);
+  void load_btf(const std::string &mod_fname);
+  void load_maps(std::map<std::string, std::tuple<uint8_t *, uintptr_t>> &sections);
 
  public:
   BPFModule(unsigned flags, TableStorage *ts = nullptr, bool rw_engine_enabled = true,
@@ -125,6 +132,10 @@ class BPFModule {
   char * license() const;
   unsigned kern_version() const;
   TableStorage &table_storage() { return *ts_; }
+  int bcc_func_load(int prog_type, const char *name,
+                    const struct bpf_insn *insns, int prog_len,
+                    const char *license, unsigned kern_version,
+                    int log_level, char *log_buf, unsigned log_buf_size);
 
  private:
   unsigned flags_;  // 0x1 for printing
@@ -149,6 +160,8 @@ class BPFModule {
   std::map<std::string, std::string> src_dbg_fmap_;
   TableStorage *ts_;
   std::unique_ptr<TableStorage> local_ts_;
+  BTF *btf_;
+  std::map<int, std::tuple<int, std::string, int, int, int, int>> fake_fd_maps_;
 };
 
 }  // namespace ebpf
